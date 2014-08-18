@@ -10,7 +10,7 @@ SMTP_FQDN="$HOSTNAME"
 NAMED_PATH="/var/named"
 NAMED_CONF_RELATIVE_PATH="conf"
 NAMED_ZONE_RELATIVE_PATH="masters"
-NAMED_ALLOW_TRANSFER_ACLS="southbridge;"
+NAMED_ALLOW_TRANSFER_ACLS="acl;"
 
 # postgresql settings
 if [ -f "/etc/init.d/pgbouncer" ]; then

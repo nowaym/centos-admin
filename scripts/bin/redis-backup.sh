@@ -10,7 +10,6 @@
 
 # External config - override default values set below
 # EXTERNAL_CONFIG="/etc/default/automongobackup" # debian style
-EXTERNAL_CONFIG="/srv/southbridge/etc/redis-backup.conf" # centos style
 
 # Username to access the mongo server e.g. dbuser
 # Unnecessary if authentication is off
@@ -69,6 +68,24 @@ OPLOG="yes"
 
 # Enable and use journaling.
 JOURNAL="yes"
+
+# Dir search with redis config
+DIR="/etc"
+
+# redis-cli path
+REDISCLI=/usr/bin/redis-cli
+
+BACKUP_AOF="no"
+BACKUP_RDB="yes"
+
+# Enable cron for run redis-cli -p port bgrewriteaof
+REWRITEAOF="yes"
+
+# when run first job (Day of mont)
+CRONSTART=1
+
+# difference between jobs (Days)
+CRONDIFFDAY=2
 
 # Choose other Server if is Replica-Set Master
 #REPLICAONSLAVE="no"
@@ -144,18 +161,20 @@ LOGERR=$BACKUPDIR/ERRORS_$DBHOST-`date +%N`.log # Logfile Name
 BACKUPFILES=""
 OPT="" # OPT string for use with mongodump
 DAY=`date +%d%m%Y`
+CRONMSGTMP=/tmp/cron_redis_rewriteaof
+CRONMSG=/etc/cron.d/redis_rewriteaof
 
 LOCATION="$(cd -P -- "$(dirname -- "$0")" && pwd -P)/.."
 
-#if [ -f "$LOCATION/etc/redis-backup.conf.dist" ]; then
-#    . "$LOCATION/etc/redis-backup.conf.dist"
-#    if [ -f "$LOCATION/etc/redis-backup.conf" ]; then
-#	. "$LOCATION/etc/redis-backup.conf"
-#    fi
-#else
-#    echo "redis-backup.conf.dist not found"
-#    exit 0
-#fi
+if [ -f "$LOCATION/etc/redis-backup.conf.dist" ]; then
+    . "$LOCATION/etc/redis-backup.conf.dist"
+    if [ -f "$LOCATION/etc/redis-backup.conf" ]; then
+	. "$LOCATION/etc/redis-backup.conf"
+    fi
+else
+    echo "redis-backup.conf.dist not found"
+    exit 0
+fi
 
 if [ ! "$DO_HOT_BACKUP" ];
     then
@@ -190,11 +209,11 @@ keep="$2"
 
 (cd ${mdbdir}
 
-    totalFilesCount=`/bin/ls -1 | egrep ".rdb|.aof|.bz2|.tgz|.gz" | wc -l`
+    totalFilesCount=`/bin/ls -1 | egrep ".rdb|.aof|.bz2|.tgz|.gz|.log" | wc -l`
 
     if [ ${totalFilesCount} -gt ${keep} ]; then
         purgeFilesCount=`expr ${totalFilesCount} - ${keep}`
-        purgeFilesList=`/bin/ls -1tr | head -${purgeFilesCount}`
+        purgeFilesList=`/bin/ls -1tr | egrep ".rdb|.aof|.bz2|.tgz|.gz|.log" | head -${purgeFilesCount}`
 
         echo ""
         echo "Rotating Folder: Purging in ${mdbdir}"
@@ -207,29 +226,44 @@ keep="$2"
 # Database dump function
 dbdump () {
 
-for i in `find /etc -maxdepth 1 -name "redis*.conf" -type f -print | grep -v "sentinel"`
+for i in `find $DIR -maxdepth 1 -name "redis*.conf" -type f -print | grep -v "sentinel"`
 do
 
     DBPORT=`cat $i | grep -v "^#" | grep "." | grep port | awk '{print($2)}'`
     DBPATH=`cat $i | grep -v "^#" | grep "." | grep dir | awk '{print($2)}'`
     DBFILE=`cat $i | grep -v "^#" | grep "." | grep dbfilename | awk '{print($2)}'`
     DBFILE=`basename $DBFILE`
+    DBPASS=`cat $i | grep -v "^#" | grep "." | grep requirepass | awk '{print($2)}'`
     APPEND=`cat $i | egrep -v "^#|aof" | grep "." | grep appendonly | awk '{print($2)}'`
     if [ "$APPEND" = "yes" ];then
-	APPENDFILE=`cat $i | grep -v "^#" | grep "." | grep appendfilename | awk '{print($2)}'`
+	APPENDFILE=`cat $i | grep -v "^#" | grep "." | grep appendfilename | awk '{print($2)}' | sed "s/\"//g"`
 	APPENDFILE=`basename $APPENDFILE`
     fi
+    if [ -z "$DBPASS" ];then
+	DBPASS="password"
+    fi
     BACKUPDIRNAME=$BACKUPDIR/$DBPORT/
-    /usr/bin/redis-cli -p $DBPORT save >> /dev/null
-#    sleep 15
     [ ! -d "$BACKUPDIRNAME" ] && mkdir $BACKUPDIRNAME
-    /bin/cp -f $DBPATH/$DBFILE $BACKUPDIRNAME/${DATE}_$DBFILE
-    if [ "$APPEND" = "yes" ];then
-	/bin/cp -f $DBPATH/$APPENDFILE $BACKUPDIRNAME/${DATE}_$APPENDFILE
-        rotateFolder $BACKUPDIRNAME `expr $DAILY + $DAILY`
+    if [ "$BACKUP_RDB" = "yes" ];then
+	#$REDISCLI -p $DBPORT -a $DBPASS bgsave >> /dev/null
+	/bin/cp -f ${DBPATH}${DBFILE} ${BACKUPDIRNAME}${DATE}_$DBFILE
+	compression $BACKUPDIRNAME ${DATE}_$DBFILE
+    fi
+    if [ "$APPEND" = "yes" -a "$BACKUP_AOF" = "yes" ];then
+	/bin/cp -f ${DBPATH}${APPENDFILE} ${BACKUPDIRNAME}${DATE}_$APPENDFILE
+	compression $BACKUPDIRNAME ${DATE}_$APPENDFILE
+        rotateFolder $BACKUPDIRNAME `expr $DAILY \* 2`
     else
         rotateFolder $BACKUPDIRNAME $DAILY
     fi
+
+    if [ "$REWRITEAOF" = "yes" -a "$APPEND" = "yes" ];then
+	if [ ! -e $CRONMSG ];then
+    	    echo "0 0 $CRONSTART * * root $REDISCLI -p $DBPORT -a $DBPASS bgrewriteaof >/dev/null" >> $CRONMSGTMP
+    	    CRONSTART=`expr $CRONSTART + $CRONDIFFDAY`
+	fi
+    fi
+
     
 done
 
@@ -300,7 +334,13 @@ echo Backup Start `date`
 echo ======================================================================
 
     echo Doing backup
-    dbdump && compression $BACKUPDIRNAME ${DATE}_$DBFILE
+    dbdump 
+
+    if [ "$REWRITEAOF" = "yes" -a ! -e $CRONMSG -a -e $CRONMSGTMP ];then
+	cat $CRONMSGTMP > $CRONMSG
+    	/sbin/service crond reload
+    fi
+
 
 echo Backup End Time `date`
 echo ======================================================================
@@ -321,6 +361,10 @@ eval $POSTBACKUP
 echo
 echo ======================================================================
 fi
+
+
+# Clean Backup Logs
+rotateFolder $BACKUPDIR `expr $DAILY \* 2`
 
 # Clean up IO redirection if we plan not to deliver log via e-mail.
 [ ! "x$MAILCONTENT" == "xlog" ] && exec 1>&6 2>&7 6>&- 7>&-
@@ -378,7 +422,8 @@ if [ -s "$LOGERR" ]
         STATUS=0
 fi
 # Clean up Logfile
-eval rm -f "$LOGFILE"
-eval rm -f "$LOGERR"
+#eval rm -f "$LOGFILE"
+#eval rm -f "$LOGERR"
+eval rm -f "$CRONMSGTMP"
 
 exit $STATUS
